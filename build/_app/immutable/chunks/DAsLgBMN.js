@@ -1,0 +1,1 @@
+const n=(t,r="RUB")=>new Intl.NumberFormat("ru-RU",{style:"currency",currency:r,minimumFractionDigits:2,maximumFractionDigits:2}).format(t),i=t=>{const r=typeof t=="string"?new Date(t):t;return new Intl.DateTimeFormat("ru-RU",{year:"numeric",month:"2-digit",day:"2-digit"}).format(r)};export{i as a,n as f};
