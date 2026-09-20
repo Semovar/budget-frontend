@@ -29,6 +29,11 @@
 	let imports: any[] = [];
 	let loadingImports = false;
 
+	// Карты из выписки и карты пользователя для маппинга
+	let userCards: any[] = [];
+	let statementCards: Array<{ name: string; number: string; last4: string }> = [];
+	let cardMappingsMap: Record<string, string> = {};
+
 	onMount(() => {
 		loadAccounts();
 		loadBanks();
@@ -70,8 +75,25 @@
 		try {
 			const response = await apiClient.get('/accounts');
 			accounts = response.data || [];
+			await loadCards();
 		} catch (error: any) {
 			toastStore.error(getErrorMessage(error));
+		}
+	}
+
+	// Загружаем карты пользователя: у каждого счёта свой набор карт (GET /accounts/:id/cards)
+	async function loadCards() {
+		userCards = [];
+		for (const acc of accounts) {
+			try {
+				const r = await apiClient.get(`/accounts/${acc.id}/cards`);
+				const cards = r.data || [];
+				for (const c of cards) {
+					userCards.push({ ...c, account_id: acc.id, account_name: acc.account_name });
+				}
+			} catch {
+				// карт у счёта может не быть
+			}
 		}
 	}
 
@@ -97,6 +119,44 @@
 	$: filteredAccounts = selectedBank
 		? accounts.filter((a) => a.bank_id === selectedBank)
 		: accounts;
+
+	// Сброс счёта, если он не принадлежит выбранному банку
+	$: if (selectedBank) {
+		if (selectedAccount && !filteredAccounts.some((a) => a.id === selectedAccount)) {
+			selectedAccount = '';
+		}
+	}
+
+	// Собираем уникальные карты из метаданных распарсенных транзакций (card_name + card_number_masked)
+	function detectStatementCards() {
+		const map = new Map<string, { name: string; number: string; last4: string }>();
+		for (const tx of parsedTransactions) {
+			const cn = tx.metadata?.card_name;
+			const cl = tx.metadata?.card_number_masked; // вида ****1234
+			if (cn && cl) {
+				const last4 = cl.replace(/\*/g, '').slice(-4);
+				// картой считается строка, где карта реально есть
+				if (!last4) continue;
+				const key = `${cn}::${last4}`;
+				if (!map.has(key)) map.set(key, { name: cn, number: cl, last4 });
+			}
+		}
+		statementCards = Array.from(map.values());
+	}
+
+	// Автоподбор карт пользователя по последним 4 цифрам номера
+	function autoMatchCards() {
+		for (const sc of statementCards) {
+			const match = userCards.find((uc) => String(uc.last_four || uc.card_number_last4 || '').trim() === sc.last4);
+			if (match) {
+				cardMappingsMap[`${sc.name}::${sc.last4}`] = match.id;
+			}
+		}
+	}
+
+	function statementCardKey(sc: { name: string; last4: string }): string {
+		return `${sc.name}::${sc.last4}`;
+	}
 
 	// Сброс счёта, если он не принадлежит выбранному банку
 	$: if (selectedBank) {
@@ -190,6 +250,11 @@
 				}
 			}
 
+			if (jobStatus === 'completed') {
+				detectStatementCards();
+				autoMatchCards();
+			}
+
 			if (jobStatus === 'processing' || jobStatus === 'pending') {
 				// Экспоненциальный backoff: увеличиваем интервал до максимума
 				pollInterval = Math.min(pollInterval * 1.5, maxPollInterval);
@@ -249,7 +314,11 @@
 			return;
 		}
 		try {
-			await apiClient.post('/parser/classify', {
+			if (!jobId) {
+				toastStore.warning('Нет активного задания (job_id)');
+				return;
+			}
+			await apiClient.post(`/parser/${jobId}/classify`, {
 				job_id: jobId,
 				transactions: parsedTransactions.filter((tx) => !tx.category_id).map((tx) => ({
 					amount: tx.amount,
@@ -288,16 +357,42 @@ async function commitTransactions() {
 		}
 
 		try {
+			// Разрешаем счёт по карте: если у транзакции есть карта и она сопоставлена с картой пользователя,
+			// берём счёт этой карты; иначе — общий выбранный счёт.
+			const resolveAccountForTx = (tx: any): { account_id?: string; card_id?: string } => {
+				const cn = tx.metadata?.card_name;
+				const cl = tx.metadata?.card_number_masked;
+				if (cn && cl) {
+					const last4 = cl.replace(/\*/g, '').slice(-4);
+					const mappedCardId = cardMappingsMap[`${cn}::${last4}`];
+					if (mappedCardId) {
+						const userCard = userCards.find((uc) => uc.id === mappedCardId);
+						if (userCard) {
+							return { account_id: userCard.account_id, card_id: mappedCardId };
+						}
+					}
+				}
+				if (commitAccountId) {
+					return { account_id: commitAccountId };
+				}
+				return {};
+			};
+
 			const body: any = {
-				transactions: parsedTransactions.map((tx) => ({
-					amount: tx.amount,
-					description: tx.description || '',
-					date: tx.date,
-					time: tx.time || null,
-					currency: tx.currency || 'RUB',
-					external_id: tx.external_id || null,
-					category_id: tx.category_id || null
-				}))
+				transactions: parsedTransactions.map((tx) => {
+					const resolved = resolveAccountForTx(tx);
+					return {
+						amount: tx.amount,
+						description: tx.description || '',
+						date: tx.date,
+						time: tx.time || null,
+						currency: tx.currency || 'RUB',
+						external_id: tx.external_id || null,
+						category_id: tx.category_id || null,
+						statement_account: tx.statement_account || tx.metadata?.card_number_masked || '',
+						...resolved
+					};
+				})
 			};
 			if (commitAccountId) body.account_id = commitAccountId;
 			if (accountMappings.length > 0) body.account_mappings = accountMappings;
@@ -310,6 +405,8 @@ async function commitTransactions() {
 			parsedTransactions = [];
 			statementAccounts = [];
 			accountMappingsMap = {};
+			cardMappingsMap = {};
+			statementCards = [];
 			selectedFile = null;
 			selectedAccount = '';
 		} catch (error: any) {
@@ -322,6 +419,15 @@ async function commitTransactions() {
 			accountMappingsMap[statementValue] = accountId;
 		} else {
 			delete accountMappingsMap[statementValue];
+		}
+	}
+
+	function onCardMappingChange(sc: { name: string; last4: string }, userCardId: string) {
+		const key = statementCardKey(sc);
+		if (userCardId) {
+			cardMappingsMap[key] = userCardId;
+		} else {
+			delete cardMappingsMap[key];
 		}
 	}
 
@@ -430,6 +536,38 @@ async function commitTransactions() {
 			</div>
 
 {#if jobStatus === 'completed' && parsedTransactions.length > 0}
+
+			{#if statementCards.length > 0}
+				<div class="mb-4 rounded-md bg-yellow-50 p-3">
+					<p class="text-sm font-medium text-gray-800 mb-1">
+						Карты в выписке — сопоставьте с вашими картами:
+					</p>
+					<p class="text-xs text-gray-600 mb-2">
+						Если карты нет среди ваших — выберите «нет карты» или создайте новую.
+					</p>
+					<div class="space-y-2">
+						{#each statementCards as sc}
+							<div class="flex items-center gap-2">
+								<span class="text-sm text-gray-800 w-52 truncate">
+									{sc.name || 'Карта'} <span class="font-mono text-gray-500">({sc.number})</span>
+								</span>
+								<select
+									value={cardMappingsMap[statementCardKey(sc)] || ''}
+									on:change={(e) => onCardMappingChange(sc, selectValueOf(e.currentTarget))}
+									class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 text-sm"
+								>
+									<option value="">— нет карты / игнорировать —</option>
+									{#each userCards as uc}
+										<option value={uc.id}>
+											{uc.name || 'Карта'} …{uc.last_four}{uc.account_name ? ` — ${uc.account_name}` : ''}
+										</option>
+									{/each}
+								</select>
+							</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
 
 			{#if statementAccounts.length > 0}
 				<div class="mb-4 rounded-md bg-gray-50 p-3">
