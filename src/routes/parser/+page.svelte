@@ -6,6 +6,7 @@
 	import { getErrorMessage } from '$lib/utils/error-handler';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Card from '$lib/components/ui/Card.svelte';
+	import Modal from '$lib/components/ui/Modal.svelte';
 	import Input from '$lib/components/ui/Input.svelte';
 	import Select from '$lib/components/ui/Select.svelte';
 	import Loader from '$lib/components/ui/Loader.svelte';
@@ -33,6 +34,47 @@
 	let userCards: any[] = [];
 	let statementCards: Array<{ name: string; number: string; last4: string }> = [];
 	let cardMappingsMap: Record<string, string> = {};
+
+	// Инлайн-создание карты в маппинге
+	let showNewCardModal = false;
+	let newCardForm = { account_id: '', name: '', last_four: '' };
+	let creatingCard = false;
+
+	function openNewCard(sc: { name: string; last4: string }) {
+		newCardForm = { account_id: '', name: sc.name || '', last_four: sc.last4 || '' };
+		showNewCardModal = true;
+	}
+
+	async function saveNewCard() {
+		if (!newCardForm.account_id) {
+			toastStore.error('Выберите счёт для карты');
+			return;
+		}
+		if (!newCardForm.last_four || newCardForm.last_four.length !== 4) {
+			toastStore.error('Укажите последние 4 цифры номера карты');
+			return;
+		}
+		creatingCard = true;
+		try {
+			const r = await apiClient.post('/cards', {
+				account_id: newCardForm.account_id,
+				last_four: newCardForm.last_four,
+				name: newCardForm.name || null
+			});
+			const card = r.data;
+			const acc = accounts.find((a) => a.id === card.account_id);
+			userCards.push({ ...card, account_id: card.account_id, account_name: acc?.account_name || '' });
+			// Подставляем новую карту в маппинг текущей карты выписки
+			const sc = statementCards.find((s) => s.last4 === card.last_four);
+			if (sc) cardMappingsMap[statementCardKey(sc)] = card.id;
+			showNewCardModal = false;
+			toastStore.success('Карта создана');
+		} catch (error: any) {
+			toastStore.error(getErrorMessage(error));
+		} finally {
+			creatingCard = false;
+		}
+	}
 
 	onMount(() => {
 		loadAccounts();
@@ -563,6 +605,13 @@ async function commitTransactions() {
 										</option>
 									{/each}
 								</select>
+								<button
+									type="button"
+									on:click={() => openNewCard(sc)}
+									class="whitespace-nowrap rounded-md border border-gray-300 px-2 py-1 text-xs font-medium text-primary-700 hover:bg-primary-50"
+								>
+									+ новая карта
+								</button>
 							</div>
 						{/each}
 					</div>
@@ -724,4 +773,27 @@ async function commitTransactions() {
 		{/if}
 	</Card>
 </div>
+
+<!-- Модальное окно создания карты -->
+<Modal open={showNewCardModal} title="Новая карта" on:close={() => (showNewCardModal = false)}>
+	<div class="space-y-4">
+		<Select
+			label="Счёт (обязательно)"
+			bind:value={newCardForm.account_id}
+			placeholder="Выберите счёт"
+			options={accounts.map((a) => ({
+				value: a.id,
+				label: a.account_name + (a.account_last5 ? ` (…${a.account_last5})` : '')
+			}))}
+		/>
+		<Input label="Название карты" bind:value={newCardForm.name} placeholder="VISA Classic" />
+		<Input label="Последние 4 цифры номера" bind:value={newCardForm.last_four} maxlength={4} placeholder="1234" />
+	</div>
+	<div slot="footer" class="flex justify-end space-x-2">
+		<Button variant="secondary" on:click={() => (showNewCardModal = false)}>Отмена</Button>
+		<Button variant="primary" on:click={saveNewCard} disabled={creatingCard}>
+			{creatingCard ? 'Создание...' : 'Создать'}
+		</Button>
+	</div>
+</Modal>
 
